@@ -34,15 +34,16 @@ if __name__ == '__main__':
         print('config loaded.')
 
     # Load pre-trained weights
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model_path = os.path.join(config["load_weights_dir"], 'model.pth')
-    model_dict = torch.load(model_path)
+    # DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    DEVICE = 'cpu'
+    model_dict = torch.load(config["model_path"], map_location=DEVICE)
 
     # network
     model = make(config['model'])
     if any(key.startswith('module') for key in model_dict.keys()):
         model = nn.DataParallel(model)
-    model.cuda()
+    if DEVICE == 'cuda':
+        model.cuda()
     model_state_dict = model.state_dict()
     model.load_state_dict({k: v for k, v in model_dict.items() if k in model_state_dict})
     model.eval()
@@ -91,8 +92,10 @@ if __name__ == '__main__':
         with torch.no_grad():
             depth = model(image)["pred_depth"]
 
+        cv2.imwrite(os.path.join(args.outdir, os.path.splitext(os.path.basename(filename))[0] + '_depth.png'), (depth[0,0].cpu().numpy()*1000).astype(np.uint16))
+
         if args.save_cloud:
-            # raw_image = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB)
+            raw_image = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB)
             raw_image = cv2.resize(raw_image, (erp_width, erp_height), interpolation=cv2.INTER_CUBIC)
             save_point_cloud(raw_image, depth[0, 0].cpu().numpy(), os.path.join(args.outdir, os.path.splitext(os.path.basename(filename))[0] + '.ply'))
 
@@ -100,6 +103,7 @@ if __name__ == '__main__':
             depth = F.interpolate(depth, (h, w), mode='bilinear', align_corners=False)[0, 0]
         else:
             depth = depth[0, 0]
+
         depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
         depth = depth.cpu().numpy().astype(np.uint8)
         
