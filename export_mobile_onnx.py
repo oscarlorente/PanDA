@@ -1,6 +1,6 @@
 from __future__ import absolute_import, division, print_function
 """
-ExecuTorch Model Export Script for Mobile Deployment
+ONNX Model Export Script for Mobile Deployment
 
 Optimization flags:
   --merge-lora        Merge LoRA A/B matrices into base QKV weights (default on).
@@ -15,25 +15,22 @@ Optimization flags:
                       Expect ~20-30% encoder speedup with some quality loss.
                       Evaluate quality before using in production.
 
-Backend guide:
-  xnnpack  — CPU, best compatibility (recommended)
-  vulkan   — Android GPU (experimental, FP16 not yet stable)
-  coreml   — Apple ANE (macOS/iOS only)
-  cpu      — basic CPU fallback
+  --fp16              Export with FP16 weights. Uses FP32 I/O with internal FP16
+                      so no runtime code changes are needed.
 """
 import argparse
 import copy
 import yaml
 import torch
 import torch.nn as nn
+import torch.onnx
 
-from executorch.exir import to_edge_transform_and_lower
 
 from networks.models import *
 
 
 class ModelWrapperFP16(nn.Module):
-    """FP32 I/O with internal FP16 — no Android code changes needed."""
+    """FP32 I/O with internal FP16 — no runtime code changes needed."""
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -47,7 +44,7 @@ class ModelWrapperFP16(nn.Module):
 
 
 class ModelWrapperFP32(nn.Module):
-    """Standard FP32 wrapper."""
+    """Wrapper to extract only the depth prediction from the model output."""
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -59,18 +56,27 @@ class ModelWrapperFP32(nn.Module):
         return output
 
 
-def export_model_with_executorch(
+def export_model_with_onnx(
     config_path,
     output_path,
     example_input_size=(1, 3, 504, 1008),
-    backend='xnnpack',
     use_fp16=False,
     merge_lora=True,
     fuse_layer_scale=True,
     num_encoder_layers=4,
 ):
-    backend_name = backend.lower()
+    """
+    Export model using ONNX for mobile deployment.
 
+    Args:
+        config_path: Path to config YAML file
+        output_path: Path where exported model will be saved (.onnx)
+        example_input_size: Tuple of (batch, channels, height, width) for export
+        use_fp16: FP32 I/O with internal FP16 weights
+        merge_lora: Merge LoRA A/B matrices into base QKV weights before export
+        fuse_layer_scale: Fuse LayerScale gamma into linear weights before export
+        num_encoder_layers: Number of encoder layers at inference (2 or 4)
+    """
     print(f"Loading configuration from {config_path}...")
     with open(config_path, 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
@@ -143,47 +149,19 @@ def export_model_with_executorch(
     print(f"  LayerScale fused  : {fuse_layer_scale}")
     print(f"  Input size        : {example_input_size}")
 
-    def _count_delegated(edge_program):
-        graph = edge_program.exported_program().graph
-        total = sum(1 for n in graph.nodes if n.op == 'call_function')
-        delegated = sum(1 for n in graph.nodes if 'lowered_module' in str(n))
-        return total, delegated
-
+    print(f"Exporting model with input size {example_input_size}...")
     try:
-        print("Running torch.export.export()...")
-        exported_program = torch.export.export(wrapped_model, sample_inputs)
+        print("Running torch.onnx.export()...")
 
-        print("Converting to ExecuTorch format...")
-        partitioner = []
-        edge_compile_config = None
-
-        if backend_name == 'vulkan':
-            from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner
-            partitioner = [VulkanPartitioner()]
-        elif backend_name == 'xnnpack':
-            from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
-            partitioner = [XnnpackPartitioner()]
-        elif backend_name == 'coreml':
-            from executorch.backends.apple.coreml.partition import CoreMLPartitioner
-            from executorch.exir import EdgeCompileConfig
-            partitioner = [CoreMLPartitioner()]
-            edge_compile_config = EdgeCompileConfig(_skip_dim_order=True)
-        else:
-            print("Using basic CPU backend (no partitioner)...")
-
-        to_edge_kwargs = dict(partitioner=partitioner)
-        if edge_compile_config is not None:
-            to_edge_kwargs['compile_config'] = edge_compile_config
-
-        edge_program = to_edge_transform_and_lower(exported_program, **to_edge_kwargs)
-        total, delegated = _count_delegated(edge_program)
-        print(f"Graph nodes: {total} total, {delegated} delegated to {backend_name.upper()}")
-
-        executorch_program = edge_program.to_executorch()
-
-        print(f"Saving to {output_path}...")
-        with open(output_path, "wb") as file:
-            file.write(executorch_program.buffer)
+        torch.onnx.export(
+            wrapped_model,
+            sample_inputs,
+            output_path,
+            input_names=["input"],
+            output_names=["depth"],
+            opset_version=18,          # 18+ required; Resize op has no downgrade adapter to 17
+            dynamic_axes=None,         # fixed shape — matches your CoreML approach
+        )
 
         print(f"✓ Export complete: {output_path}")
         return True
@@ -196,14 +174,15 @@ def export_model_with_executorch(
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Export PanDA with ExecuTorch')
-    parser.add_argument('--config', type=str, required=True)
-    parser.add_argument('--output', type=str, default='./checkpoints/model_mobile.pte')
+    parser = argparse.ArgumentParser(description='Export model using ONNX for mobile deployment')
+    parser.add_argument('--config', type=str, required=True,
+                        help='Path to config YAML file')
+    parser.add_argument('--output', type=str, default='./checkpoints/panda_model_mobile_504.onnx',
+                        help='Output path for ONNX model (.onnx)')
     parser.add_argument('--height', type=int, default=504,
-                        help='Input height (width = 2x). Must be a multiple of 14.')
-    parser.add_argument('--batch-size', type=int, default=1)
-    parser.add_argument('--backend', type=str, default='xnnpack',
-                        choices=['vulkan', 'xnnpack', 'coreml', 'cpu'])
+                        help='Input height (width will be 2x height for ERP). Must be a multiple of 14.')
+    parser.add_argument('--batch-size', type=int, default=1,
+                        help='Batch size for example input')
     parser.add_argument('--fp16', action='store_true',
                         help='FP32 I/O with internal FP16.')
     parser.add_argument('--no-merge-lora', action='store_true',
@@ -217,12 +196,11 @@ if __name__ == '__main__':
 
     input_size = (args.batch_size, 3, args.height, args.height * 2)
 
-    print("ExecuTorch Model Export for Mobile")
-    success = export_model_with_executorch(
+    print("ONNX Model Export for Mobile")
+    success = export_model_with_onnx(
         config_path=args.config,
         output_path=args.output,
         example_input_size=input_size,
-        backend=args.backend,
         use_fp16=args.fp16,
         merge_lora=not args.no_merge_lora,
         fuse_layer_scale=not args.no_fuse_layer_scale,
@@ -230,4 +208,4 @@ if __name__ == '__main__':
     )
 
     if success:
-        print("Done.")
+        print("Export completed successfully!")

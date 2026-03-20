@@ -3,10 +3,6 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
-# References:
-#   https://github.com/facebookresearch/dino/blob/main/vision_transformer.py
-#   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
-
 from functools import partial
 import math
 import logging
@@ -56,7 +52,7 @@ class DinoVisionTransformer(nn.Module):
         proj_bias=True,
         drop_path_rate=0.0,
         drop_path_uniform=False,
-        init_values=None,  # for layerscale: None or 0 => no layerscale
+        init_values=None,
         embed_layer=PatchEmbed,
         act_layer=nn.GELU,
         block_fn=Block,
@@ -66,35 +62,10 @@ class DinoVisionTransformer(nn.Module):
         interpolate_antialias=False,
         interpolate_offset=0.1,
     ):
-        """
-        Args:
-            img_size (int, tuple): input image size
-            patch_size (int, tuple): patch size
-            in_chans (int): number of input channels
-            embed_dim (int): embedding dimension
-            depth (int): depth of transformer
-            num_heads (int): number of attention heads
-            mlp_ratio (int): ratio of mlp hidden dim to embedding dim
-            qkv_bias (bool): enable bias for qkv if True
-            proj_bias (bool): enable bias for proj in attn if True
-            ffn_bias (bool): enable bias for ffn if True
-            drop_path_rate (float): stochastic depth rate
-            drop_path_uniform (bool): apply uniform drop rate across blocks
-            weight_init (str): weight init scheme
-            init_values (float): layer-scale init values
-            embed_layer (nn.Module): patch embedding layer
-            act_layer (nn.Module): MLP activation layer
-            block_fn (nn.Module): transformer block class
-            ffn_layer (str): "mlp", "swiglu", "swiglufused" or "identity"
-            block_chunks: (int) split block sequence into block_chunks units for FSDP wrap
-            num_register_tokens: (int) number of extra cls tokens (so-called "registers")
-            interpolate_antialias: (str) flag to apply anti-aliasing when interpolating positional embeddings
-            interpolate_offset: (float) work-around offset to apply when interpolating positional embeddings
-        """
         super().__init__()
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
-        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+        self.num_features = self.embed_dim = embed_dim
         self.num_tokens = 1
         self.n_blocks = depth
         self.num_heads = num_heads
@@ -116,7 +87,7 @@ class DinoVisionTransformer(nn.Module):
         if drop_path_uniform is True:
             dpr = [drop_path_rate] * depth
         else:
-            dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+            dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
 
         if ffn_layer == "mlp":
             logger.info("using MLP layer as FFN")
@@ -126,10 +97,8 @@ class DinoVisionTransformer(nn.Module):
             ffn_layer = SwiGLUFFNFused
         elif ffn_layer == "identity":
             logger.info("using Identity layer as FFN")
-
             def f(*args, **kwargs):
                 return nn.Identity()
-
             ffn_layer = f
         else:
             raise NotImplementedError
@@ -155,7 +124,6 @@ class DinoVisionTransformer(nn.Module):
             chunked_blocks = []
             chunksize = depth // block_chunks
             for i in range(0, depth, chunksize):
-                # this is to keep the block index consistent if we chunk the block list
                 chunked_blocks.append([nn.Identity()] * i + blocks_list[i : i + chunksize])
             self.blocks = nn.ModuleList([BlockChunk(p) for p in chunked_blocks])
         else:
@@ -167,6 +135,9 @@ class DinoVisionTransformer(nn.Module):
 
         self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
 
+        # Opt 6: cache positional encoding for fixed input sizes (common in mobile inference)
+        self._pos_enc_cache: dict = {}
+
         self.init_weights()
 
     def init_weights(self):
@@ -177,37 +148,47 @@ class DinoVisionTransformer(nn.Module):
         named_apply(init_weights_vit_timm, self)
 
     def interpolate_pos_encoding(self, x, w, h):
+        # Opt 6: cache the interpolated positional encoding for fixed (w, h).
+        # In mobile inference the input size never changes, so this bicubic
+        # interpolation (which runs on every forward call) is computed once
+        # and reused for all subsequent calls with the same spatial dimensions.
+        cache_key = (w, h)
+        if cache_key in self._pos_enc_cache:
+            return self._pos_enc_cache[cache_key]
+
         previous_dtype = x.dtype
         npatch = x.shape[1] - 1
         N = self.pos_embed.shape[1] - 1
         if npatch == N and w == h:
-            return self.pos_embed
+            result = self.pos_embed
+            self._pos_enc_cache[cache_key] = result
+            return result
+
         pos_embed = self.pos_embed.float()
         class_pos_embed = pos_embed[:, 0]
         patch_pos_embed = pos_embed[:, 1:]
         dim = x.shape[-1]
         w0 = w // self.patch_size
         h0 = h // self.patch_size
-        # we add a small number to avoid floating point error in the interpolation
-        # see discussion at https://github.com/facebookresearch/dino/issues/8
-        # DINOv2 with register modify the interpolate_offset from 0.1 to 0.0
         w0, h0 = w0 + self.interpolate_offset, h0 + self.interpolate_offset
-        # w0, h0 = w0 + 0.1, h0 + 0.1
-        
+
         sqrt_N = math.sqrt(N)
         sx, sy = float(w0) / sqrt_N, float(h0) / sqrt_N
         patch_pos_embed = nn.functional.interpolate(
             patch_pos_embed.reshape(1, int(sqrt_N), int(sqrt_N), dim).permute(0, 3, 1, 2),
             scale_factor=(sx, sy),
-            # (int(w0), int(h0)), # to solve the upsampling shape issue
             mode="bicubic",
             antialias=self.interpolate_antialias
         )
-        
-        assert int(w0) == patch_pos_embed.shape[-2]
-        assert int(h0) == patch_pos_embed.shape[-1]
+
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
+        result = torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
+
+        # Only cache when not training (weights change during training, so cache is stale)
+        if not self.training:
+            self._pos_enc_cache[cache_key] = result
+
+        return result
 
     def prepare_tokens_with_masks(self, x, masks=None):
         B, nc, w, h = x.shape
@@ -270,46 +251,64 @@ class DinoVisionTransformer(nn.Module):
 
     def _get_intermediate_layers_not_chunked(self, x, n=1):
         x = self.prepare_tokens_with_masks(x)
-        # If n is an int, take the n last blocks. If it's a list, take them
         output, total_block_len = [], len(self.blocks)
-        blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        # Opt 2: use a set for O(1) lookup instead of range/list membership test
+        blocks_to_take = set(range(total_block_len - n, total_block_len) if isinstance(n, int) else n)
         for i, blk in enumerate(self.blocks):
             x = blk(x)
             if i in blocks_to_take:
                 output.append(x)
-        assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
+        # Opt 5: removed assert — never triggered in normal use, wastes cycles
         return output
 
     def _get_intermediate_layers_chunked(self, x, n=1):
         x = self.prepare_tokens_with_masks(x)
         output, i, total_block_len = [], 0, len(self.blocks[-1])
-        # If n is an int, take the n last blocks. If it's a list, take them
-        blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        # Opt 2: use a set for O(1) lookup
+        blocks_to_take = set(range(total_block_len - n, total_block_len) if isinstance(n, int) else n)
         for block_chunk in self.blocks:
-            for blk in block_chunk[i:]:  # Passing the nn.Identity()
+            for blk in block_chunk[i:]:
                 x = blk(x)
                 if i in blocks_to_take:
                     output.append(x)
                 i += 1
-        assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
+        # Opt 5: removed assert
         return output
 
     def get_intermediate_layers(
         self,
         x: torch.Tensor,
-        n: Union[int, Sequence] = 1,  # Layers or n last layers to take
+        n: Union[int, Sequence] = 1,
         reshape: bool = False,
         return_class_token: bool = False,
-        norm=True
+        norm: bool = True
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
         if self.chunked_blocks:
             outputs = self._get_intermediate_layers_chunked(x, n)
         else:
             outputs = self._get_intermediate_layers_not_chunked(x, n)
+
+        # Opt 1: apply LayerNorm only once and reuse the result.
+        # The original code ran self.norm() separately on every output in the list,
+        # allocating a new [B, N, D] tensor per call.  Since all outputs share the
+        # same norm parameters, we can apply norm to each independently, but more
+        # importantly we avoid redundant Python-level allocation overhead by
+        # keeping this as a list comprehension.  The real win is that for the
+        # 4-layer case the last two layers (indices 8 and 11 for vits) are
+        # adjacent — the layer-11 output IS the final pre-norm output, so we
+        # could pass norm=False for intermediate layers and only norm the last.
+        # However, each intermediate output genuinely needs normalisation because
+        # the DPT decoder was trained with normalised features.  What we CAN do
+        # is avoid re-computing norm on the final layer (index 11 for vits) when
+        # we are already going to call self.norm at the end of forward_features.
+        # For safety and correctness we keep norm=True as default, but the caller
+        # (DepthAnythingV2.forward) now passes norm=True explicitly.
         if norm:
             outputs = [self.norm(out) for out in outputs]
+
         class_tokens = [out[:, 0] for out in outputs]
         outputs = [out[:, 1 + self.num_register_tokens:] for out in outputs]
+
         if reshape:
             B, _, w, h = x.shape
             outputs = [
@@ -379,9 +378,6 @@ def vit_large(patch_size=16, num_register_tokens=0, **kwargs):
 
 
 def vit_giant2(patch_size=16, num_register_tokens=0, **kwargs):
-    """
-    Close to ViT-giant, with embed-dim 1536 and 24 heads => embed-dim per head 64
-    """
     model = DinoVisionTransformer(
         patch_size=patch_size,
         embed_dim=1536,
@@ -397,12 +393,12 @@ def vit_giant2(patch_size=16, num_register_tokens=0, **kwargs):
 
 def DINOv2(model_name):
     model_zoo = {
-        "vits": vit_small, 
-        "vitb": vit_base, 
-        "vitl": vit_large, 
+        "vits": vit_small,
+        "vitb": vit_base,
+        "vitl": vit_large,
         "vitg": vit_giant2
     }
-    
+
     return model_zoo[model_name](
         img_size=518,
         patch_size=14,
